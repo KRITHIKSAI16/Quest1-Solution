@@ -1,0 +1,205 @@
+notes on what I told the AI while building this and why. keeping this because the
+architecture went through a couple of real reversals and I want the reasoning on
+record, not just the final result.
+
+---
+
+Aug 24 — environment constraints
+
+ACTUAL PROMPT
+"Set this up for a CPU-only pipeline. Everything has to run out of a Python
+venv with pip-only dependencies — no library that needs a system-level binary
+install (no assuming ffmpeg or an OCR engine is already on PATH). Get the
+environment initialized and confirm that constraint before we write any
+pipeline code."
+
+REASONING
+Wanted this nailed down before any real code got written, since it's the kind
+of constraint that's expensive to retrofit later. ffmpeg ended up bundled
+through imageio-ffmpeg instead of assuming it's installed, opencv-python-
+headless for decode, yt-dlp as a library rather than a subprocess call. Whole
+thing installs with one pip install -r requirements.txt, nothing else to
+configure.
+
+---
+
+Aug 24 — validating the target before picking a strategy
+
+ACTUAL PROMPT
+"Before we pick a matching strategy, verify what's actually in the reference
+video — don't assume 'on-screen dialogue' automatically means burned-in
+subtitles. I watched it myself: the target line is spoken around 5:26 into a
+54-minute video, and there's no text on screen at that point. Cross-check that
+against independent sources and sample frames across the whole runtime before
+we commit to an OCR-only design."
+
+REASONING
+Didn't want to build the whole pipeline around an assumption I hadn't actually
+checked. Confirmed it two ways — an IMDB quotes page for the episode, and
+thumbnails sampled across the full runtime — no subtitles anywhere during
+actual dialogue, only on title/credit cards. So the OCR-only pipeline I'd
+originally asked for was dead on arrival for this input, and I had to scrap
+that and rethink the architecture from here.
+
+---
+
+Aug 24 — the architecture reversal
+
+ACTUAL PROMPT
+"Don't make ASR primary with OCR as a fallback that only kicks in when audio
+finds nothing — that's a silent-failure trap. If the transcript matches
+something confidently but wrong, OCR never even runs, so we'd have no way to
+catch it. Same problem in reverse if a future test video turns out to be
+audio-only. Redesign this as two independent channels that both always run,
+with a separate fusion step deciding what to do with the results — not a
+'primary' pipeline with a fallback bolted on."
+
+REASONING
+This is the single most consequential decision in the project. Once OCR-only
+was ruled out by the previous entry, the obvious move is "just make ASR
+primary instead" — but that has the exact same class of failure in reverse: a
+confident wrong answer from one channel that the other never gets a chance to
+check. Running both channels unconditionally and handing the results to a
+separate fusion step avoids that class of bug entirely instead of hoping it
+doesn't come up. That's core/locate.py running both channels and core/fuse.py
+doing the merge afterward — neither channel knows the other exists while it's
+running.
+
+---
+
+Aug 24 — fusion and tie-breaking
+
+ACTUAL PROMPT
+"Don't fuse the two channels by picking whichever has the higher confidence
+score. An EasyOCR score and a Whisper score aren't measuring the same kind of
+error, so comparing them numerically doesn't mean much, and it throws away the
+most useful signal there is — if audio says 00:15 and visual says 00:45,
+that's not noise to average away, that's one of them being confidently wrong.
+Also don't hardcode a 'visual wins on a tie' rule as the fallback — that
+contradicts the evidence that got us onto dual-channel in the first place.
+Compare timestamps before scores: agreement within a tolerance window is
+corroborated, disagreement gets flagged and returned as-is, and --strict picks
+by modality validation, never a fixed channel preference."
+
+REASONING
+Caught the visual-wins idea myself before it got built, which is the only
+reason it's mentioned at all — the entire reason there's an audio channel is
+that I'd already proven the target line isn't on screen for this video, so
+using that same assumption as a tie-break after disproving it would have been
+circular. The score-comparison point matters for the same underlying reason:
+neither channel's confidence number is a ground-truth probability, so treating
+either "highest score wins" or "one modality always wins" as principled is a
+mistake — the only thing actually comparable between channels is where in
+time they each land.
+
+---
+
+Aug 24 — CPU performance budget
+
+ACTUAL PROMPT
+"OCR across the full 54-minute video at native resolution isn't viable, that's
+close to a full day of runtime at the latency we measured. Sample the visual
+channel at low fps, crop to a lower-band ROI as a fast path with an automatic
+full-frame fallback if that comes up empty, dedup near-identical frames before
+OCR'ing them, and cap the image size going into every OCR call. For audio, use
+faster-whisper's small English model at int8 instead of plain whisper — better
+CPU throughput, and word-level timestamps come out of it directly instead of
+needing a second alignment pass."
+
+REASONING
+Dual-channel was already going to cost more build time than a single-channel
+design, so I didn't want it to also be unusably slow to run. Every one of
+these levers is there because it was measured, not guessed — the ROI crop has
+an automatic fallback specifically so it never turns into a silent wrong
+answer on a video where the text isn't in the expected band.
+
+---
+
+Aug 25 — ingestion robustness
+
+ACTUAL PROMPT
+"We just hit two real failures getting the reference video — a network-level
+block on one host, and a download that reported success while it had actually
+silently dropped 9.5 minutes of fragments. Think through how the ingestion
+layer should handle this generically, not just patch around this one video.
+Keep it generic, no hardcoding to this host or this file. No automatic network
+switching. Don't over-engineer it. And make sure a missing, wrong, or
+unreachable video URL fails cleanly instead of throwing a raw error at
+whoever's running it."
+
+REASONING
+These weren't hypothetical edge cases, they were failures I actually hit
+acquiring the reference video, so I wanted the fix to generalize rather than
+special-case this one file. Ended up with typed exceptions so callers branch
+on type instead of message text, bounded retries with backoff for transient
+failures, and a completeness check that compares the source's reported
+duration against what actually landed on disk before trusting a download. Also
+explicitly ruled out a custom segment-level HLS fetcher — yt-dlp already does
+that correctly if configured right, and building one wouldn't have fixed the
+actual failure anyway (a blocked manifest page, nothing to do with fragments).
+
+---
+
+Aug 25 — query vs. extracted text
+
+ACTUAL PROMPT
+"Double check the output is actually showing the extracted text, not just my
+search input echoed back. If I search for something close but not
+character-for-character exact to the real line, does the result print what I
+typed or what the pipeline actually found in the video? Those need to look
+visibly different — a typo on my end shouldn't be able to pass itself off as
+a match."
+
+REASONING
+This came from a doubt, not a confirmed bug — I wasn't sure whether the tool
+was showing me real evidence or just reflecting my own input back at me, and
+that distinction matters: the input is a query, what actually comes out of
+OCR/ASR is a separate observation, and the two will legitimately differ
+(typos on my end, OCR noise, punctuation). Result now carries target_text and
+text as two separate fields, and the console/report both show them side by
+side instead of collapsing to one value.
+
+---
+
+Aug 25 — audio onset precision bug
+
+ACTUAL PROMPT
+"Ran --mode audio searching for a word I could hear clearly around the 10-11
+second mark, but the timestamp it reported was several seconds earlier — looks
+like the start of the whole sentence, not where the word actually is. Find
+what's actually causing this before you fix it, don't just nudge the number
+until it looks right."
+
+REASONING
+Insisted on root-causing this rather than patching the symptom, since a
+timing bug that "looks fixed" without an explanation tends to come back in a
+different shape. Root cause: the matching function saturates at max score for
+any span that merely contains the target, with no penalty for extra padding,
+and the tie-break kept whichever span hit that score first — almost always
+the widest, earliest one. Fixed by adding a second scoring pass that breaks
+ties toward the tightest matching span instead of the first one found. While
+in there, also caught frame_index being computed with int(timestamp * fps),
+which truncates and was consistently picking a frame a bit early — switched
+to round(). Both got dedicated tests afterward, since there was zero coverage
+on that function before this.
+
+---
+
+Aug 25 — interactive mode and the HTML report
+
+ACTUAL PROMPT
+"Add an interactive flow for running this by hand — prompt for the URL, the
+target text, and the search mode, with the mode as a proper arrow-key menu,
+not something I have to type out. Also generate a self-contained HTML report
+at the end of a run so I'm not staring at a JSON file to see what happened.
+Neither of these can affect the headless path — --url and --text need to keep
+working exactly as before with zero prompts when both are supplied, and the
+report can't pull from a CDN or need any network access to render, same
+reasoning as the acquisition-layer work: don't assume the network is there."
+
+REASONING
+This was purely for demo/day-to-day use, but I didn't want it to compromise
+the actual invocation path the tool is scripted/run through, so the headless
+guarantee was non-negotiable. cli.py only opens the interactive flow when
+--url or --text is missing; report_html.py embeds everything — CSS, the frame
+as a base64 image — into one file so it's portable on its own.
