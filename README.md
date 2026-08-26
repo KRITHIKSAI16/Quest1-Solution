@@ -142,7 +142,6 @@ python cli.py --url "https://youtu.be/DzUc3Eqzzos" --text "calm down" --mode aud
 
 ![Example output for "calm down"](screenshot-calm-down.png)
 
-*(screenshot placeholder, save the terminal/`report.html` output for this exact command as `screenshot-calm-down.png` in the repo root, next to this file)*
 
 ## Test
 
