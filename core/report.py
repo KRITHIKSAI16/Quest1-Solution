@@ -21,6 +21,31 @@ def format_timestamp(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:06.3f}"
 
 
+def face_status_label(face_detected: bool | None) -> str:
+    """same three-value story everywhere this gets shown — console, HTML
+    report, wherever. True/False/None (not checked) are genuinely different
+    things and none of them should get collapsed into one of the others.
+    """
+    if face_detected is True:
+        return "Yes — confirmed on screen"
+    if face_detected is False:
+        return "No — not confirmed on screen"
+    return "Not checked"
+
+
+def mouth_motion_label(mouth_motion: bool | None) -> str:
+    """report-only signal, same three-value treatment as face_status_label.
+    only meaningful once a face is already confirmed, callers should check
+    that before printing this — there's nothing to say about mouth motion
+    on a face that was never found.
+    """
+    if mouth_motion is True:
+        return "Yes — elevated motion during the line"
+    if mouth_motion is False:
+        return "No sign of speech-like motion"
+    return "Not checked"
+
+
 @dataclass
 class Result:
     outcome: str
@@ -36,6 +61,14 @@ class Result:
     image_path: str | None = None
     diagnostics: dict = field(default_factory=dict)
     target_text: str | None = None  # what the user searched for, separate from `text` (what we actually found)
+    # audio channel only: whether a face was confirmed near the match. None
+    # means the check didn't run at all (disabled, or unavailable) — not the
+    # same as a confirmed absence, so it's kept as a distinct third value
+    # all the way out to the final report, not collapsed into False.
+    face_detected: bool | None = None
+    # report-only, see mouth_motion_label() — never affects the outcome,
+    # only meaningful when face_detected is True.
+    mouth_motion: bool | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -55,6 +88,8 @@ def build_result(fusion: FusionResult, primary: Candidate | None, target: str, d
         near_misses=[asdict(n) for n in fusion.near_misses],
         diagnostics=diagnostics or {},
         target_text=target,
+        face_detected=primary.face_detected if primary else None,
+        mouth_motion=primary.mouth_motion if primary else None,
     )
 
 
@@ -97,12 +132,25 @@ def print_report(result: Result):
         print(f"Text       : \"{result.text}\"", file=out)
         print(f"Channel    : {result.channel}", file=out)
         print(f"Confidence : {result.confidence:.1f}", file=out)
+        if result.channel == "audio":
+            # this is the actual answer to "is it on-screen dialogue or not"
+            # — stated plainly, not left implicit in the outcome enum name
+            print(f"On-screen  : {face_status_label(result.face_detected)}", file=out)
+            if result.face_detected is True:
+                # only worth showing once a face is actually confirmed —
+                # this is extra evidence about that face, report-only
+                print(f"Speaking   : {mouth_motion_label(result.mouth_motion)}", file=out)
     if len(result.all_candidates) > 1:
         # both channels found something (CORROBORATED or AMBIGUOUS), show both
         print("Per-channel evidence:", file=out)
         for c in result.all_candidates:
+            extra = ""
+            if c["channel"] == "audio":
+                extra = f"  face: {face_status_label(c.get('face_detected'))}"
+                if c.get("face_detected") is True:
+                    extra += f"  speaking: {mouth_motion_label(c.get('mouth_motion'))}"
             print(f"  [{c['channel']}] {format_timestamp(c['timestamp_s'])}  "
-                  f"{c['confidence']:.1f}  \"{c['matched_text']}\"", file=out)
+                  f"{c['confidence']:.1f}  \"{c['matched_text']}\"{extra}", file=out)
     if result.ambiguity_status:
         print(f"Note       : {result.ambiguity_status}", file=out)
     if result.uncertain:
@@ -143,6 +191,12 @@ def print_report(result: Result):
         ad = result.diagnostics.get("audio", {})
         if "segments_transcribed" in ad:
             print(f"  audio                : {ad['segments_transcribed']} transcript segments", file=out)
+        if "face_check" in ad:
+            fc = ad["face_check"]
+            print(f"  audio (face check)   : {fc['checked']} candidate(s) checked, {fc['found']} with a face on screen", file=out)
+        if "mouth_motion_check" in ad:
+            mc = ad["mouth_motion_check"]
+            print(f"  audio (mouth motion) : {mc['checked']} face(s) checked, {mc['elevated']} with elevated motion", file=out)
 
     out.flush()
     if wrapper is not None:

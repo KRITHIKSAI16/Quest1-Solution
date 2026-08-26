@@ -103,6 +103,9 @@ def main(
     sample_fps: float = typer.Option(DEFAULT.sample_fps, "--sample-fps", help="Visual channel sampling rate"),
     strict: bool = typer.Option(False, "--strict", help="Force a single answer even on ambiguous/uncertain results"),
     no_report: bool = typer.Option(False, "--no-report", help="Skip generating report.html (result.json is still written)"),
+    no_face_check: bool = typer.Option(False, "--no-face-check", help="Skip the on-screen face check for audio matches"),
+    face_check_window: float = typer.Option(DEFAULT.face_check_window_s, "--face-check-window", help="Seconds around the audio onset to look for a face"),
+    no_mouth_motion_check: bool = typer.Option(False, "--no-mouth-motion-check", help="Skip the mouth-motion signal (report-only, never affects the outcome)"),
 ):
     interactive = url is None or text is None  # only prompt if one of these is actually missing
     if url is None or text is None:
@@ -118,6 +121,9 @@ def main(
         sample_fps=sample_fps,
         roi_bottom_fraction=roi,
         force_full_frame=full_frame,
+        face_check_enabled=not no_face_check,
+        face_check_window_s=face_check_window,
+        mouth_motion_check_enabled=not no_mouth_motion_check,
     )
 
     with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as progress:

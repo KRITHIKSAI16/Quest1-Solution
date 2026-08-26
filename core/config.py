@@ -23,6 +23,12 @@ class Config:
     whisper_model: str = "small.en"
     whisper_device: str = "cpu"
     whisper_compute_type: str = "int8"
+    face_check_enabled: bool = True
+    face_check_window_s: float = 0.5  # how far around the onset frame to look for a face
+    mouth_motion_check_enabled: bool = True  # report-only signal, never gates the outcome
+    mouth_motion_baseline_offset_s: float = 1.5  # how far before the onset to sample the "quiet" comparison window
+    mouth_motion_sample_fps: float = 12.0  # dense-sampling rate within each window, for frame-to-frame motion
+    mouth_motion_ratio: float = 1.6  # speech-window motion must exceed baseline by this factor to count as "elevated"
 
     # --- matching (shared) ---
     confident_threshold: float = 85.0

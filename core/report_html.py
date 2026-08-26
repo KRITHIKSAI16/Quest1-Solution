@@ -8,10 +8,11 @@ import base64
 import html
 import os
 
-from core.report import Result, format_timestamp
+from core.report import Result, face_status_label, format_timestamp, mouth_motion_label
 
 _OUTCOME_LABELS = {
     "CONFIRMED_BY_AUDIO": ("Confirmed · Audio", "ok"),
+    "CONFIRMED_BY_AUDIO_OFF_SCREEN": ("Confirmed · Audio (off-screen)", "warn"),
     "CONFIRMED_BY_VISUAL": ("Confirmed · Visual", "ok"),
     "CORROBORATED": ("Corroborated · Both channels", "ok"),
     "AMBIGUOUS": ("Ambiguous · Channels disagree", "warn"),
@@ -139,8 +140,12 @@ footer {
 """
 
 
-def _badge(outcome: str) -> str:
+def _badge(outcome: str, face_detected: bool | None = None) -> str:
     label, kind = _OUTCOME_LABELS.get(outcome, (outcome, "warn"))
+    if outcome == "CONFIRMED_BY_AUDIO" and face_detected is True:
+        # spell out the positive case too, not just the off-screen one —
+        # this badge is the actual answer to "is it on-screen or not"
+        label = "Confirmed · Audio (on-screen)"
     return f'<span class="badge {kind}">{html.escape(label)}</span>'
 
 
@@ -160,11 +165,13 @@ def _candidate_table(candidates: list[dict]) -> str:
           <td class="mono">{html.escape(format_timestamp(c['timestamp_s']))}</td>
           <td class="mono">{c['confidence']:.1f}</td>
           <td>{html.escape(c['matched_text'])}</td>
+          <td>{html.escape(face_status_label(c.get('face_detected'))) if c['channel'] == 'audio' else '—'}</td>
+          <td>{html.escape(mouth_motion_label(c.get('mouth_motion'))) if c['channel'] == 'audio' and c.get('face_detected') is True else '—'}</td>
         </tr>""" for c in candidates)
     return f"""
     <div class="evidence-label">Per-channel evidence</div>
     <table>
-      <thead><tr><th>Channel</th><th>Timestamp</th><th>Confidence</th><th>Extracted text</th></tr></thead>
+      <thead><tr><th>Channel</th><th>Timestamp</th><th>Confidence</th><th>Extracted text</th><th>On-screen face</th><th>Speaking sign</th></tr></thead>
       <tbody>{rows}</tbody>
     </table>"""
 
@@ -211,6 +218,18 @@ def _found_section(result: Result) -> str:
             <div class="stat-value">{confidence:.1f}</div>
             <div class="confidence-bar"><div class="confidence-fill" style="width:{max(0, min(100, confidence)):.1f}%;"></div></div>
           </div>"""
+        if result.channel == "audio":
+            stats_html += f"""
+          <div>
+            <div class="stat-label">On-screen face</div>
+            <div class="stat-value">{html.escape(face_status_label(result.face_detected))}</div>
+          </div>"""
+            if result.face_detected is True:
+                stats_html += f"""
+          <div>
+            <div class="stat-label">Speaking sign</div>
+            <div class="stat-value">{html.escape(mouth_motion_label(result.mouth_motion))}</div>
+          </div>"""
     else:
         extracted_html = ""
         stats_html = ""
@@ -226,7 +245,7 @@ def _found_section(result: Result) -> str:
       </div>
       <div class="card">
         <div class="meta">
-          <div>{_badge(result.outcome)}</div>
+          <div>{_badge(result.outcome, result.face_detected)}</div>
           {extracted_html}
           {stats_html}
           {note_html}
@@ -285,7 +304,7 @@ def generate_html_report(result: Result, target_text: str, source: str, out_dir:
     <span class="brand">Quest1</span>
     <span class="breadcrumb">~/quest1/report</span>
     <div class="spacer"></div>
-    {_badge(result.outcome)}
+    {_badge(result.outcome, result.face_detected)}
   </div>
   <main>
     <h1>Dialogue <em>Extraction</em> Report</h1>

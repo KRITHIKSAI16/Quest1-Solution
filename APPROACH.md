@@ -115,6 +115,86 @@ The backward walk is capped (default 10 s) so a pathological match can't run awa
 
 **Same normalisation as the visual channel.** The transcript passes through the identical `matcher.py` normalisation (NFKC, casefold, punctuation strip, whitespace collapse) before fuzzy scoring. Deliberately shared code, so both channels get scored by the same rules even though (§4) their raw scores are never compared to each other directly.
 
+### Audio confirmation isn't the same thing as on-screen confirmation
+
+An ASR match only proves the target line exists somewhere in the audio track. It doesn't prove the
+speaker is actually visible when they say it: a voiceover, an internal monologue, or a line delivered
+off-camera would all match just as confidently. On-screen dialogue, by the working definition this
+project uses, is a line spoken by a character who's both present and visible in the current shot, so
+audio evidence alone isn't sufficient to claim that.
+
+`core/face.py` checks for a face near the audio onset frame (`cv2.FaceDetectorYN`, backed by a
+bundled ~227KB ONNX model from the OpenCV Zoo, `core/models/face_detection_yunet_2023mar.onnx`).
+Not mediapipe: checked first, and its latest release has no wheel for Python 3.13 on any platform.
+Not the classic Haar-cascade detector either, that's been the default answer to "cheap local face
+detection in OpenCV" for two decades, but OpenCV 5.0 (already a dependency here) dropped both
+`cv2.CascadeClassifier` and the bundled cascade XML files from the Python wheel entirely. YuNet is
+the modern replacement and is more accurate anyway, so this isn't a downgrade forced by necessity.
+
+A single frame is not a reliable read for this. A face turned three-quarters away, mid-blink, or hit
+by a motion-blurred pan can make the detector miss a face that's genuinely there, the same "don't
+trust one frame" lesson already applied to the visual channel's OCR onset walk (§2). So the check
+looks at a small window of frames around the onset (`--face-check-window`, default ±0.5s), not just
+the exact computed timestamp, and counts a face as present if *any* frame in that window shows one.
+
+**This never discards a correct audio match, it only relabels it.** Three outcomes:
+
+| Case | What happens |
+|---|---|
+| A face is confirmed near the onset (possibly by preferring a different, face-confirmed occurrence of the same line over a higher-confidence but faceless one) | Reported exactly as before: `CONFIRMED_BY_AUDIO` (or `CORROBORATED` if visual agrees) |
+| No face found at any confident audio candidate's onset | Still returns the best-confidence candidate, full timestamp/frame/text/confidence, nothing thrown away, but under a new outcome, `CONFIRMED_BY_AUDIO_OFF_SCREEN`, with an explicit note that no on-screen presence was confirmed |
+| The detector itself is unavailable (missing model file, load failure) | Total bypass, `face_detected` stays `None` everywhere, behaves identically to a build without this feature at all |
+
+The failure-open design here matters as much as the detection itself. A single-frame face read from a
+2-decade-old-style detector's modern successor is still not something to trust enough to silently drop
+an otherwise-correct, already-independently-verified audio match. That would trade a labeling
+inaccuracy for a much worse failure: reporting no result at all when the pipeline actually found the
+right answer. `--no-face-check` turns the whole thing off if needed.
+
+**The face-detection result is stated explicitly, not just implied by the outcome name.** The whole
+point of this feature is answering "is this genuinely on-screen dialogue or not." Burying that answer
+inside an enum value (`CONFIRMED_BY_AUDIO` vs `CONFIRMED_BY_AUDIO_OFF_SCREEN`) and leaving the reader to
+infer it defeats the purpose. So every surface says it plainly: the console prints a dedicated
+`On-screen : Yes / No — not confirmed on screen / Not checked` line whenever the primary result is
+audio, `result.json` carries `face_detected` both at the top level and per candidate, and
+`report.html`'s badge itself spells it out (`Confirmed · Audio (on-screen)` vs `(off-screen)`), with a
+matching stat row and, on `CORROBORATED`/`AMBIGUOUS`, an `On-screen face` column in the per-channel
+evidence table. Same three-value story (`True`/`False`/`None`) everywhere it appears, via one shared
+`face_status_label()` helper in `core/report.py`, not three independently-worded copies that could
+drift out of sync with each other.
+
+### An addition on top: mouth motion, still report-only, still not gating anything
+
+Face presence alone can't distinguish a character actively delivering a line from one silently
+listening while a voiceover plays over them. Both show a static "face detected" reading, since
+that check has no temporal dimension at all. `FacePresenceDetector.mouth_motion_elevated()` adds one:
+it tracks the two mouth-corner landmarks `cv2.FaceDetectorYN.detect()` already returns on every call
+(15 columns per face: bbox, five landmarks including both mouth corners, and a score; nothing new
+to compute, these were already being thrown away), normalizes their distance by inter-ocular
+distance (standard scale-invariance trick so the metric means the same thing regardless of how close
+the face is to camera), and measures how much that normalized distance moves frame-to-frame across
+the onset window. That's compared against the same measurement over a same-length window shortly
+before the match (`--face-check-window` before, offset back by
+`mouth_motion_baseline_offset_s`, default 1.5s), a *relative* comparison rather than one fixed
+global threshold, so it adapts to each video's own idle-motion level instead of guessing a universal
+cutoff.
+
+**Verified against the real reference video, not just synthetic tests, and the honest result is a
+useful negative, not a clean confirmation.** At the actual onset (00:05:24.640), the raw numbers:
+speech-window energy 0.00130, baseline-window energy 0.00163. The baseline is not lower, it's
+*higher*. The reason is specific and instructive: Jeremy Brett delivers this line as part of a
+continuous monologue, so the window "shortly before" the matched line is not actually quiet, it's
+him still mid-speech from the preceding sentence. The baseline-offset design assumes a nearby quiet
+reference exists; that assumption fails on continuous dialogue, which is common, not a rare edge
+case. This is exactly why the decision to keep this report-only rather than gating was correct.
+Had this signal been wired to demote the outcome, it would have taken an already-correct,
+already-independently-verified result and cast doubt on it based on a baseline comparison that
+didn't hold. No threshold or offset was retuned to make this one case read differently after seeing
+the result, that would be fitting a parameter to a single data point, the same trap already flagged
+above (§1) about not hand-tuning thresholds to one sample. The honest scope of this feature: real
+evidence, reported plainly, that a static face-presence check alone doesn't have, not a solved
+active-speaker detector, and it doesn't claim to be one.
+
 ---
 
 ## 4. How it handles ambiguous or uncertain results
@@ -157,7 +237,8 @@ Each channel is thresholded independently. A visual score of 85 and an audio sco
 
 | # | Case | Outcome state | Behaviour |
 |---|---|---|---|
-| 1 | Audio confident, visual not | `CONFIRMED_BY_AUDIO` | Return the audio candidate |
+| 1 | Audio confident, visual not, a face confirmed near the onset | `CONFIRMED_BY_AUDIO` | Return the audio candidate |
+| 1b | Audio confident, visual not, no face confirmed at any candidate onset | `CONFIRMED_BY_AUDIO_OFF_SCREEN` | Return the same audio candidate, flagged as audio-only evidence (§3) |
 | 2 | Visual confident, audio not | `CONFIRMED_BY_VISUAL` | Return the visual candidate |
 | 3 | Both confident, timestamps agree within tolerance | `CORROBORATED` | Highest-confidence result; independent corroboration reported |
 | 4 | Both confident, timestamps substantially differ | `AMBIGUOUS` | Both candidates returned, never silently resolved |
@@ -209,6 +290,8 @@ core/
   gate.py        Frame dedup (MAD) + text-presence heuristic (visual channel)
   ocr.py         OCR engine interface + EasyOCR implementation (visual channel)
   asr.py         faster-whisper wrapper, word-level timestamps (audio channel)
+  face.py        On-screen presence check for audio matches (YuNet, audio channel)
+  models/        Bundled face_detection_yunet_2023mar.onnx (~227KB, OpenCV Zoo)
   matcher.py     Normalisation (NFKC, casefold, punctuation strip) + rapidfuzz
                  scoring, shared by both channels so they're scored by
                  identical rules even though never compared cross-channel
@@ -219,7 +302,8 @@ core/
   report_html.py Self-contained report.html (embedded CSS, base64 frame)
   config.py      All tunables in one dataclass
 cli.py           Typer entrypoint: --url --text --out --mode --roi --full-frame
-                 --sample-fps --strict --no-report
+                 --sample-fps --strict --no-report --no-face-check
+                 --face-check-window --no-mouth-motion-check
 tests/
 ```
 
@@ -269,6 +353,7 @@ Streamlit is the intended future UI precisely because it runs the pipeline in-pr
 | Decode | OpenCV | Ubiquitous, simple, straightforward to reason about line by line | Seeking can be imprecise on some codecs; PyAV exposes true PTS but costs complexity |
 | OCR (visual) | EasyOCR | Accurate on subtitles, pip-only, multilingual insurance | Pulls ~2.5 GB of PyTorch (shared cost with the audio channel below); slower per call than an ONNX runtime |
 | ASR (audio) | `faster-whisper` | CTranslate2 backend, CPU-fast, word-level timestamps natively (needed for speech onset, not just line detection) | Additional model download (`small.en`); one more dependency to maintain |
+| Face detection | `cv2.FaceDetectorYN` (bundled ONNX) | Already-installed OpenCV, no new pip dependency; more accurate than Haar cascade | mediapipe has no Python 3.13 wheel yet (checked directly); Haar cascade itself is gone from OpenCV 5.0's Python wheel, so this is genuinely the current option, not a preference; the tradeoff is a small (~227KB) binary model file committed to the repo |
 | Matching | `rapidfuzz` | C++ speed, well-maintained; shared by both channels so they're normalised identically | — |
 | CLI | Typer + Rich | Typed args, good `--help`, readable progress output | — |
 
@@ -297,8 +382,11 @@ Frame      : 7771
 Text       : " My mind rebels at stagnation."
 Channel    : audio
 Confidence : 100.0
+On-screen  : Yes — confirmed on screen
 ```
 
-That's 1.36 seconds from the reference-video timestamp (05:26) I observed directly while watching the video. The saved frame was visually confirmed to show the correct scene, Jeremy Brett in close-up, matching the framing of my own screenshot. No timestamp was hardcoded anywhere in the search path to produce this; the pipeline located the line independently via ASR, word-level alignment, and fuzzy matching, exactly as designed in §1 and §3.
+That's 1.36 seconds from the reference-video timestamp (05:26) I observed directly while watching the video. The saved frame was visually confirmed to show the correct scene, Jeremy Brett in close-up, matching the framing of my own screenshot. No timestamp was hardcoded anywhere in the search path to produce this; the pipeline located the line independently via ASR, word-level alignment, and fuzzy matching, exactly as designed in §1 and §3. The face check (§3) independently confirms the same thing the original observation did: `face_detected: true` at this exact frame.
 
 This result was obtained on a file whose provenance required independent verification before use. A four-check process (header inspection, decoder consistency, splice-boundary inspection, full decode-integrity scan) confirmed the file was sound in the region this search needed, and precisely localized a real defect elsewhere in the file that the search never touches.
+
+(The mouth-motion signal on this exact case reads `False`, not `True`. That's the honest, real-footage finding documented in §3, not a contradiction of the result above. It reflects the baseline-window assumption breaking down on continuous monologue delivery, not doubt about whether the line is on screen; face presence, independently verified twice over, already settles that.)

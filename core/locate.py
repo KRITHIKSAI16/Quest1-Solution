@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 from core.asr import WhisperTranscriber, extract_audio
 from core.config import Config
+from core.face import FacePresenceDetector
 from core.fuse import Candidate, FusionResult, NearMiss, Outcome, fuse, resolve_strict
 from core.gate import FrameGate
 from core.matcher import alignment_ratio, score as fuzzy_score
@@ -169,6 +170,12 @@ def run_audio_channel(video_path: str, video: VideoSource, target: str, cfg: Con
     candidates: list[Candidate] = []
     near_misses: list[NearMiss] = []
 
+    face_detector = FacePresenceDetector() if cfg.face_check_enabled else None
+    faces_checked = 0
+    faces_found = 0
+    motion_checked = 0
+    motion_elevated = 0
+
     for seg in segments:
         s = fuzzy_score(seg.text, target)
         if s < cfg.uncertain_threshold:
@@ -184,10 +191,35 @@ def run_audio_channel(video_path: str, video: VideoSource, target: str, cfg: Con
         # index like the visual channel gets, so it's approximate on VFR video.
         # round() not int(), truncating always picks a frame too early.
         frame_idx = round(onset_s * video.meta.fps)
+
+        face_detected = None
+        mouth_motion = None
+        if face_detector is not None:
+            face_detected = face_detector.has_face_near(video, frame_idx, cfg.face_check_window_s)
+            if face_detected is not None:
+                faces_checked += 1
+                faces_found += int(face_detected)
+            # only worth measuring motion for a face we actually confirmed —
+            # this is extra evidence about that face, not a check on its own
+            if face_detected is True and cfg.mouth_motion_check_enabled:
+                mouth_motion = face_detector.mouth_motion_elevated(
+                    video, onset_s, cfg.face_check_window_s, cfg.mouth_motion_baseline_offset_s,
+                    cfg.mouth_motion_sample_fps, cfg.mouth_motion_ratio,
+                )
+                if mouth_motion is not None:
+                    motion_checked += 1
+                    motion_elevated += int(mouth_motion)
+
         candidates.append(Candidate(
             channel="audio", timestamp_s=onset_s, frame_index=frame_idx,
             confidence=s, matched_text=seg.text, matching_method="partial_ratio/token_set_ratio",
+            face_detected=face_detected, mouth_motion=mouth_motion,
         ))
+
+    if face_detector is not None:
+        diag["face_check"] = {"available": face_detector.available, "checked": faces_checked, "found": faces_found}
+        if cfg.mouth_motion_check_enabled:
+            diag["mouth_motion_check"] = {"checked": motion_checked, "elevated": motion_elevated}
 
     near_misses.sort(key=lambda n: -n.confidence)
     return candidates, near_misses[:cfg.near_miss_top_n], diag

@@ -10,6 +10,7 @@ from enum import Enum
 
 class Outcome(Enum):
     CONFIRMED_BY_AUDIO = "CONFIRMED_BY_AUDIO"
+    CONFIRMED_BY_AUDIO_OFF_SCREEN = "CONFIRMED_BY_AUDIO_OFF_SCREEN"
     CONFIRMED_BY_VISUAL = "CONFIRMED_BY_VISUAL"
     CORROBORATED = "CORROBORATED"
     AMBIGUOUS = "AMBIGUOUS"
@@ -24,6 +25,13 @@ class Candidate:
     confidence: float
     matched_text: str
     matching_method: str  # e.g. "partial_ratio", "token_set_ratio"
+    # audio channel only. True/False if the face check ran, None if it
+    # didn't (detector unavailable, or this is a visual candidate).
+    face_detected: bool | None = None
+    # audio channel only, and only when face_detected is True. report-only —
+    # never read by fuse() or resolve_strict(), purely extra evidence shown
+    # alongside the outcome, not a second gate.
+    mouth_motion: bool | None = None
 
 
 @dataclass
@@ -44,6 +52,24 @@ class FusionResult:
     uncertain: bool = False
 
 
+def _pick_audio_best(a_confident: list[Candidate]) -> Candidate | None:
+    """picks the best audio candidate, preferring one with a confirmed face
+    over one without when the face check actually ran on any of them. this
+    is the "keep looking" behavior for a repeated line: if the target gets
+    said more than once, prefer the occurrence where the speaker is visible
+    over a higher-confidence-but-faceless one. falls back to plain
+    confidence when nothing was face-confirmed, or the check never ran.
+    """
+    if not a_confident:
+        return None
+    face_checked = [c for c in a_confident if c.face_detected is not None]
+    if face_checked:
+        on_screen = [c for c in a_confident if c.face_detected is True]
+        if on_screen:
+            return max(on_screen, key=lambda c: c.confidence)
+    return max(a_confident, key=lambda c: c.confidence)
+
+
 def fuse(
     visual_candidates: list[Candidate],
     audio_candidates: list[Candidate],
@@ -56,7 +82,7 @@ def fuse(
     a_confident = [c for c in audio_candidates if c.confidence >= confident_threshold]
 
     v_best = max(v_confident, key=lambda c: c.confidence, default=None)
-    a_best = max(a_confident, key=lambda c: c.confidence, default=None)
+    a_best = _pick_audio_best(a_confident)
 
     if v_best is None and a_best is None:
         near = sorted(visual_near_misses + audio_near_misses, key=lambda n: -n.confidence)
@@ -68,6 +94,17 @@ def fuse(
         )
 
     if v_best is None:
+        if a_best.face_detected is False:
+            # audio's the only evidence, and nobody was on screen for it at
+            # any candidate timestamp — still a real match, just not what
+            # "on-screen dialogue" actually means, so don't call it that
+            return FusionResult(
+                outcome=Outcome.CONFIRMED_BY_AUDIO_OFF_SCREEN,
+                primary=a_best,
+                all_candidates=[a_best],
+                ambiguity_status="audio matched the target, but no on-screen face was found "
+                                  "near this timestamp — likely a voiceover or off-camera line",
+            )
         return FusionResult(
             outcome=Outcome.CONFIRMED_BY_AUDIO,
             primary=a_best,

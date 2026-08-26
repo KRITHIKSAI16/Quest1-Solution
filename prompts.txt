@@ -4,11 +4,11 @@ record, not just the final result.
 
 ---
 
-Aug 24 — environment constraints
+Aug 24: environment constraints
 
 ACTUAL PROMPT
 "Set this up for a CPU-only pipeline. Everything has to run out of a Python
-venv with pip-only dependencies — no library that needs a system-level binary
+venv with pip-only dependencies, no library that needs a system-level binary
 install (no assuming ffmpeg or an OCR engine is already on PATH). Get the
 environment initialized and confirm that constraint before we write any
 pipeline code."
@@ -23,11 +23,11 @@ configure.
 
 ---
 
-Aug 24 — validating the target before picking a strategy
+Aug 24: validating the target before picking a strategy
 
 ACTUAL PROMPT
 "Before we pick a matching strategy, verify what's actually in the reference
-video — don't assume 'on-screen dialogue' automatically means burned-in
+video, don't assume 'on-screen dialogue' automatically means burned-in
 subtitles. I watched it myself: the target line is spoken around 5:26 into a
 54-minute video, and there's no text on screen at that point. Cross-check that
 against independent sources and sample frames across the whole runtime before
@@ -35,47 +35,47 @@ we commit to an OCR-only design."
 
 REASONING
 Didn't want to build the whole pipeline around an assumption I hadn't actually
-checked. Confirmed it two ways — an IMDB quotes page for the episode, and
-thumbnails sampled across the full runtime — no subtitles anywhere during
+checked. Confirmed it two ways: an IMDB quotes page for the episode, and
+thumbnails sampled across the full runtime. No subtitles anywhere during
 actual dialogue, only on title/credit cards. So the OCR-only pipeline I'd
 originally asked for was dead on arrival for this input, and I had to scrap
 that and rethink the architecture from here.
 
 ---
 
-Aug 24 — the architecture reversal
+Aug 24: the architecture reversal
 
 ACTUAL PROMPT
 "Don't make ASR primary with OCR as a fallback that only kicks in when audio
-finds nothing — that's a silent-failure trap. If the transcript matches
+finds nothing, that's a silent-failure trap. If the transcript matches
 something confidently but wrong, OCR never even runs, so we'd have no way to
 catch it. Same problem in reverse if a future test video turns out to be
 audio-only. Redesign this as two independent channels that both always run,
-with a separate fusion step deciding what to do with the results — not a
+with a separate fusion step deciding what to do with the results, not a
 'primary' pipeline with a fallback bolted on."
 
 REASONING
 This is the single most consequential decision in the project. Once OCR-only
 was ruled out by the previous entry, the obvious move is "just make ASR
-primary instead" — but that has the exact same class of failure in reverse: a
+primary instead", but that has the exact same class of failure in reverse: a
 confident wrong answer from one channel that the other never gets a chance to
 check. Running both channels unconditionally and handing the results to a
 separate fusion step avoids that class of bug entirely instead of hoping it
 doesn't come up. That's core/locate.py running both channels and core/fuse.py
-doing the merge afterward — neither channel knows the other exists while it's
+doing the merge afterward, neither channel knows the other exists while it's
 running.
 
 ---
 
-Aug 24 — fusion and tie-breaking
+Aug 24: fusion and tie-breaking
 
 ACTUAL PROMPT
 "Don't fuse the two channels by picking whichever has the higher confidence
 score. An EasyOCR score and a Whisper score aren't measuring the same kind of
 error, so comparing them numerically doesn't mean much, and it throws away the
-most useful signal there is — if audio says 00:15 and visual says 00:45,
+most useful signal there is: if audio says 00:15 and visual says 00:45,
 that's not noise to average away, that's one of them being confidently wrong.
-Also don't hardcode a 'visual wins on a tie' rule as the fallback — that
+Also don't hardcode a 'visual wins on a tie' rule as the fallback, that
 contradicts the evidence that got us onto dual-channel in the first place.
 Compare timestamps before scores: agreement within a tolerance window is
 corroborated, disagreement gets flagged and returned as-is, and --strict picks
@@ -83,18 +83,18 @@ by modality validation, never a fixed channel preference."
 
 REASONING
 Caught the visual-wins idea myself before it got built, which is the only
-reason it's mentioned at all — the entire reason there's an audio channel is
+reason it's mentioned at all. The entire reason there's an audio channel is
 that I'd already proven the target line isn't on screen for this video, so
 using that same assumption as a tie-break after disproving it would have been
 circular. The score-comparison point matters for the same underlying reason:
 neither channel's confidence number is a ground-truth probability, so treating
 either "highest score wins" or "one modality always wins" as principled is a
-mistake — the only thing actually comparable between channels is where in
+mistake. The only thing actually comparable between channels is where in
 time they each land.
 
 ---
 
-Aug 24 — CPU performance budget
+Aug 24: CPU performance budget
 
 ACTUAL PROMPT
 "OCR across the full 54-minute video at native resolution isn't viable, that's
@@ -102,23 +102,23 @@ close to a full day of runtime at the latency we measured. Sample the visual
 channel at low fps, crop to a lower-band ROI as a fast path with an automatic
 full-frame fallback if that comes up empty, dedup near-identical frames before
 OCR'ing them, and cap the image size going into every OCR call. For audio, use
-faster-whisper's small English model at int8 instead of plain whisper — better
+faster-whisper's small English model at int8 instead of plain whisper, better
 CPU throughput, and word-level timestamps come out of it directly instead of
 needing a second alignment pass."
 
 REASONING
 Dual-channel was already going to cost more build time than a single-channel
 design, so I didn't want it to also be unusably slow to run. Every one of
-these levers is there because it was measured, not guessed — the ROI crop has
+these levers is there because it was measured, not guessed. The ROI crop has
 an automatic fallback specifically so it never turns into a silent wrong
 answer on a video where the text isn't in the expected band.
 
 ---
 
-Aug 25 — ingestion robustness
+Aug 25: ingestion robustness
 
 ACTUAL PROMPT
-"We just hit two real failures getting the reference video — a network-level
+"We just hit two real failures getting the reference video: a network-level
 block on one host, and a download that reported success while it had actually
 silently dropped 9.5 minutes of fragments. Think through how the ingestion
 layer should handle this generically, not just patch around this one video.
@@ -134,24 +134,24 @@ special-case this one file. Ended up with typed exceptions so callers branch
 on type instead of message text, bounded retries with backoff for transient
 failures, and a completeness check that compares the source's reported
 duration against what actually landed on disk before trusting a download. Also
-explicitly ruled out a custom segment-level HLS fetcher — yt-dlp already does
+explicitly ruled out a custom segment-level HLS fetcher, yt-dlp already does
 that correctly if configured right, and building one wouldn't have fixed the
 actual failure anyway (a blocked manifest page, nothing to do with fragments).
 
 ---
 
-Aug 25 — query vs. extracted text
+Aug 25: query vs. extracted text
 
 ACTUAL PROMPT
 "Double check the output is actually showing the extracted text, not just my
 search input echoed back. If I search for something close but not
 character-for-character exact to the real line, does the result print what I
 typed or what the pipeline actually found in the video? Those need to look
-visibly different — a typo on my end shouldn't be able to pass itself off as
+visibly different, a typo on my end shouldn't be able to pass itself off as
 a match."
 
 REASONING
-This came from a doubt, not a confirmed bug — I wasn't sure whether the tool
+This came from a doubt, not a confirmed bug. I wasn't sure whether the tool
 was showing me real evidence or just reflecting my own input back at me, and
 that distinction matters: the input is a query, what actually comes out of
 OCR/ASR is a separate observation, and the two will legitimately differ
@@ -161,11 +161,11 @@ side instead of collapsing to one value.
 
 ---
 
-Aug 25 — audio onset precision bug
+Aug 25: audio onset precision bug
 
 ACTUAL PROMPT
 "Ran --mode audio searching for a word I could hear clearly around the 10-11
-second mark, but the timestamp it reported was several seconds earlier — looks
+second mark, but the timestamp it reported was several seconds earlier, looks
 like the start of the whole sentence, not where the word actually is. Find
 what's actually causing this before you fix it, don't just nudge the number
 until it looks right."
@@ -175,24 +175,24 @@ Insisted on root-causing this rather than patching the symptom, since a
 timing bug that "looks fixed" without an explanation tends to come back in a
 different shape. Root cause: the matching function saturates at max score for
 any span that merely contains the target, with no penalty for extra padding,
-and the tie-break kept whichever span hit that score first — almost always
+and the tie-break kept whichever span hit that score first, almost always
 the widest, earliest one. Fixed by adding a second scoring pass that breaks
 ties toward the tightest matching span instead of the first one found. While
 in there, also caught frame_index being computed with int(timestamp * fps),
-which truncates and was consistently picking a frame a bit early — switched
+which truncates and was consistently picking a frame a bit early, switched
 to round(). Both got dedicated tests afterward, since there was zero coverage
 on that function before this.
 
 ---
 
-Aug 25 — interactive mode and the HTML report
+Aug 25: interactive mode and the HTML report
 
 ACTUAL PROMPT
-"Add an interactive flow for running this by hand — prompt for the URL, the
+"Add an interactive flow for running this by hand, prompt for the URL, the
 target text, and the search mode, with the mode as a proper arrow-key menu,
 not something I have to type out. Also generate a self-contained HTML report
 at the end of a run so I'm not staring at a JSON file to see what happened.
-Neither of these can affect the headless path — --url and --text need to keep
+Neither of these can affect the headless path, --url and --text need to keep
 working exactly as before with zero prompts when both are supplied, and the
 report can't pull from a CDN or need any network access to render, same
 reasoning as the acquisition-layer work: don't assume the network is there."
@@ -201,5 +201,111 @@ REASONING
 This was purely for demo/day-to-day use, but I didn't want it to compromise
 the actual invocation path the tool is scripted/run through, so the headless
 guarantee was non-negotiable. cli.py only opens the interactive flow when
---url or --text is missing; report_html.py embeds everything — CSS, the frame
-as a base64 image — into one file so it's portable on its own.
+--url or --text is missing; report_html.py embeds everything, CSS, the frame
+as a base64 image, into one file so it's portable on its own.
+
+---
+
+Aug 26: audio confirmation needs an actual face on screen
+
+ACTUAL PROMPT
+"CONFIRMED_BY_AUDIO doesn't actually prove the dialogue was on screen, it just
+proves the ASR transcript matched something. A voiceover or an internal
+monologue would match just as confidently with nobody visible in the shot.
+On-screen dialogue means a character who's both present and visible in the
+current camera shot is the one saying it, so verify that a face is actually
+there. Implement it with mediapipe or OpenCV, whichever works, and make it
+fail-safe: if the face detector can't load for whatever reason, bypass it
+rather than crash. Don't just hard-drop a match to 0 faces though, a single
+frame's face read isn't reliable enough to trust blindly, so if the person
+isn't found, look for another matching occurrence before giving up, and if
+there's genuinely no on-screen confirmation anywhere, still return the audio
+match, just labeled honestly as audio-only, not silently dropped."
+
+REASONING
+Wanted this built as three real outcomes, not a pass/fail gate, specifically
+because a bad angle or motion blur on one frame shouldn't be able to turn an
+already-correct result into a false negative. mediapipe turned out to have no
+Python 3.13 wheel at all, and the classic OpenCV Haar-cascade fallback turned
+out to be gone too. OpenCV 5.0 (already a dependency here) dropped both
+cv2.CascadeClassifier and the bundled cascade files from the Python wheel
+entirely, a good two decades after that was the default answer to "cheap
+local face detection." Landed on cv2.FaceDetectorYN with a small bundled
+ONNX model instead, verified it actually loads and runs in this project's own
+environment before wiring it in. A face confirmed near the onset (or found at
+a different, repeated occurrence of the same line) behaves exactly as before;
+no face found anywhere relabels the result as CONFIRMED_BY_AUDIO_OFF_SCREEN
+but still returns the full match; detector unavailable bypasses the whole
+thing cleanly. Re-ran the reference video afterward specifically to confirm
+its already-validated result didn't get downgraded now that this is live.
+
+Follow-up same day: told it the face-check result needed to be stated
+plainly everywhere, not left implicit in the outcome name alone, someone
+reading the console output or the report shouldn't have to know that
+CONFIRMED_BY_AUDIO_OFF_SCREEN means "no face" to understand what happened.
+Added an explicit On-screen line to the console report, a matching stat row
+and badge wording (on-screen / off-screen) to report.html, and a face column
+to the per-channel evidence table, all pulling from one shared label
+function so the wording can't drift out of sync between the three surfaces.
+
+---
+
+Aug 26: mouth motion, as an addition on top of face presence, not a new approach
+
+ACTUAL PROMPT
+"See if there's any way to detect actual speaking, not just a face being
+present, using what we've already got rather than a whole new approach.
+Ruled out both of my own suggestions myself after it explained why (mouth
+cascade doesn't exist in this OpenCV build, raw optical flow can't tell
+talking apart from any other facial motion without correlating to audio), but
+push on whether there's anything addable to the existing face detector
+specifically, not a new model."
+
+REASONING
+That push is what found it: cv2.FaceDetectorYN.detect(), the exact call
+already being made for the presence check, returns mouth-corner landmarks
+on every call, unused until now. Had it build a motion-energy comparison off
+those landmarks (normalized by inter-ocular distance, compared against a
+baseline window shortly before the match rather than one fixed threshold),
+report-only, same precedent as face_detected, doesn't touch the outcome.
+
+Verified it against the real reference video rather than trusting the unit
+tests alone, and got an honest negative worth keeping: at the real onset,
+raw motion energy read HIGHER in the "baseline" window than the speech
+window, because Brett's line is mid-monologue, so the window just before it
+isn't actually quiet either. Told it explicitly not to retune the threshold
+to make that one case look better after seeing the result, that's fitting a
+parameter to a single data point, and this project already has a rule
+against exactly that. Kept as a real, honestly-scoped addition: more signal
+than face presence alone had, not a solved problem.
+
+---
+
+Aug 26: real crash, "Object of type bool is not JSON serializable"
+
+ACTUAL PROMPT
+"Ran a real search on a different video, --mode audio, target 'calm down',
+got all the way through acquiring the video and running the audio channel,
+then crashed right at the end writing result.json with 'TypeError: Object of
+type bool is not JSON serializable'. Find out why."
+
+REASONING
+The error message itself was misleading: a plain Python bool IS JSON
+serializable, so the traceback was pointing at something that shouldn't be
+able to cause this at all. Traced it to core/face.py's _dist(), which does
+arithmetic directly on numpy array slices (a real detect() row is always
+numpy), the result is numpy.float32, not a real Python float, despite the
+function's own type hint saying float. That numpy value survived all the way
+through _mouth_metric() and _window_motion_energy() into a comparison in
+mouth_motion_elevated(), which produces numpy.bool_ instead of a real bool,
+and in numpy 2.x that type's class name is literally "bool", which is why
+the traceback looked like it was blaming a normal Python bool. None of the
+tests caught it because they all mocked at a level that fed plain Python
+floats directly, never exercising the real numpy arithmetic.
+
+Fixed at the source: _dist() now casts to float() at the one place the
+numpy arithmetic happens, so nothing downstream needs its own cast. Added
+two regression tests that specifically exercise real numpy inputs through to
+a real json.dumps() call, since that's the exact gap that let this ship, and
+reproduced the original crash end-to-end against the real reference video to
+confirm it's actually fixed, not just that the new tests pass in isolation.
